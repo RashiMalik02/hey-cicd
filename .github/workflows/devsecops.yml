@@ -1,0 +1,276 @@
+name: Python DevSecOps Pipeline
+
+# When does this pipeline run?
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+
+jobs:
+
+  # ========================================
+  # STEP 1 — Run Unit Tests
+  # ========================================
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: |
+          pytest --cov=app --cov-report=term-missing
+
+
+  # ========================================
+  # STEP 2 — SAST (Find code security issues)
+  # ========================================
+
+  sast:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Analyze code
+        uses: github/codeql-action/analyze@v3
+
+
+  # ========================================
+  # STEP 3 — SCA (Check for vulnerable packages)
+  # ========================================
+
+  sca:
+    name: SCA - Dependency Scan
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      - name: Run dependency scan
+        run: |
+          pip-audit
+
+
+  # ========================================
+  # STEP 3b — Secret Scanning (gitleaks over the full git history)
+  # ========================================
+
+  secret-scan:
+    name: Secret Scan - Gitleaks
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            git /repo --redact --verbose
+
+
+  # ========================================
+  # STEP 4 — Build Docker Image
+  #          (only runs after tests, SAST, SCA and secret scan pass)
+  # ========================================
+
+  docker-build:
+    name: Docker Build
+    needs:
+      - test
+      - sast
+      - sca
+      - secret-scan
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t session17-python:${{ github.sha }} .
+
+
+  # ========================================
+  # STEP 5 — Scan Docker Image for vulnerabilities
+  # ========================================
+
+  image-scan:
+    name: Image Scan - Trivy
+    needs:
+      - docker-build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t session17-python:${{ github.sha }} .
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Scan image (full report)
+        run: |
+          trivy image --severity HIGH,CRITICAL session17-python:${{ github.sha }}
+
+      - name: Security gate - fail on fixable HIGH/CRITICAL
+        run: |
+          trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 session17-python:${{ github.sha }}
+
+
+  # ========================================
+  # STEP 6 — Push image to GitHub Container Registry (GHCR)
+  # ========================================
+
+  push:
+    name: Push Image to GHCR
+    needs:
+      - image-scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and tag image
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            -t ghcr.io/rashimalik02/hey-cicd:${{ github.sha }} \
+            -t ghcr.io/rashimalik02/hey-cicd:latest \
+            .
+
+      - name: Push image
+        run: |
+          docker push ghcr.io/rashimalik02/hey-cicd:${{ github.sha }}
+          docker push ghcr.io/rashimalik02/hey-cicd:latest
+
+
+  # ========================================
+  # STEP 7 — Deploy to Kubernetes
+  #          (only runs on push to main)
+  # ========================================
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs:
+      - push
+    runs-on: ubuntu-latest
+
+    # Skip this step on pull requests — only deploy real merges to main
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create k8s Kind Cluster (For testing deployment)
+        uses: helm/kind-action@v1.10.0
+
+      - name: Update deployment with new image tag
+        run: |
+          # Replace '__IMAGE_TAG__' placeholder with the specific git sha we just pushed
+          sed -i "s|__IMAGE_TAG__|${{ github.sha }}|g" k8s/deployment.yaml
+
+      - name: Allow the cluster to pull from GHCR
+        run: |
+          kubectl create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+          kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Check rollout status
+        run: |
+          kubectl rollout status deployment/session17-python --timeout=60s
+
+      - name: Test running website in CI (Curl)
+        run: |
+          # Forward the service port to the GitHub runner in the background
+          kubectl port-forward service/session17-python 5001:80 &
+          sleep 3
+          
+          echo "🌐 Fetching the website HTML..."
+          curl -s http://localhost:5001 | head -n 15
+          
+          echo -e "\n\n🌐 Fetching the API status..."
+          curl -s http://localhost:5001/api/status
